@@ -1,0 +1,172 @@
+http = require("resty.http")
+aes = require("resty.aes")
+str = require("resty.string")
+rand = require("resty.random")
+
+id = "secret_key"
+
+function render_response(response)
+    local headers = ""
+    for k, v in pairs(response.headers) do
+        key = tostring(key)
+        if type(values) == "table" then
+            for i, val in ipairs(values) do
+                if val ~= nil then
+                    headers = headers .. "\n" .. key .. "=" .. str.gsub(val, "\n", "")
+                end
+            end
+        elseif values ~= nil then
+            headers = headers .. "\n" .. key .. "=" .. values
+        else
+        end
+    end
+
+    local body = response.body
+    if body ~= nil then
+        body = ngx.encode_base64(body)
+    end
+
+    return tostring(response.status) .. "," .. ngx.encode_base64(headers) .. "," .. body
+end
+
+-- default in PKCS#7 padding
+function encrypt_data(key, data)
+    local random_iv = rand.bytes(16)
+    local aes_default = aes:new(key, nil, aes.cipher(128, "cbc"), 
+        {
+            iv = random_iv
+        }
+    )
+    return ngx.encode_base64(random_iv .. aes_default:encrypt(data))
+end
+
+function decrypt_data(key, data)
+    local out = ngx.decode_base64(data)
+    local aes_default = aes:new(key, nil, aes.cipher(128, "cbc"), 
+        {
+            iv = string.sub(out, 1, 16)
+        }
+    )
+    return aes_default:decrypt(string.sub(out, 17))
+end
+
+function json_output(data)
+    ngx.say(encrypt_data(id, data))
+end
+
+function str_split(src, reps, max)
+    local resultStrList = {}
+    string.gsub(src .. reps, "(.-)" .. reps, function ( w )
+        table.insert(resultStrList, w)
+    end)
+
+    if max > 0 and #resultStrList > 0 then
+        local tmp = ""
+        local finalResult = {}
+        for i, v in ipairs(resultStrList) do
+            if (i - 1) < max then
+                table.insert(finalResult, v)
+            else
+                if tmp == "" then
+                    tmp = v
+                else
+                    tmp = tmp .. reps .. v
+                end
+            end
+        end
+        table.insert(finalResult, tmp)
+        resultStrList = finalResult
+    end
+    
+    return resultStrList
+end
+
+ngx.req.read_body()
+
+local clientlog = ""
+local data = ngx.req.get_body_data()
+if not data then
+    local bodydata = ""
+    local datafile = ngx.req.get_body_file()
+
+    if not datafile then
+        ngx.exit(ngx.HTTP_BAD_REQUEST)
+    else
+        local fh, err = io.open(datafile, "r")
+        bodydata = fh:read("*a")
+        fh:close()
+    end
+
+    local result = str_split(bodydata, "=", 0)
+    if result[1] ~= "clientlog" then
+        ngx.exit(ngx.HTTP_BAD_REQUEST)
+    end
+
+    clientlog = ngx.unescape_uri(result[2])
+else
+    if not ngx.req.get_post_args().clientlog then
+        ngx.exit(ngx.HTTP_BAD_REQUEST)
+    end
+
+    clientlog = ngx.req.get_post_args().clientlog
+end
+
+data = decrypt_data(id, clientlog)
+session = str_split(data, ",", 0)
+
+if session[3] == "POST" and session[6] ~= "" then
+    session[6] = ngx.decode_base64(session[6])
+else
+    session[6] = ""
+end
+
+httpc = http.new()
+
+req_headers = {}
+org_headers = str_split(ngx.decode_base64(session[5]), "\r\n", 0)
+
+for i, vv in ipairs(org_headers) do
+    header = str_split(vv, "=", 1)
+    req_headers[header[1]] = header[2]
+end
+
+httpc:connect(session[1], session[2])
+res, err = httpc:request{
+    method = session[3],
+    path = session[4],
+    body = session[6],
+    headers = req_headers
+}
+
+response = {
+    status = res.status,
+    headers = res.headers,
+    body = res:read_body()
+}
+
+local headers = ""
+
+for key, values in pairs(res.headers) do
+    key = tostring(key)
+    if type(values) == "table" then
+        for i, val in ipairs(values) do
+            if val ~= nil then
+                headers = headers .. "\n" .. key .. "=" .. val
+            end
+        end
+    elseif values ~= nil then
+        headers = headers .. "\n" .. key .. "=" .. values
+    else
+    end
+end
+
+local body = response.body
+if body ~= nil then
+    body = ngx.encode_base64(body)
+end
+
+local out = tostring(response.status) .. "," .. ngx.encode_base64(headers) .. "," .. body
+
+httpc:close()
+
+json_output(out)
